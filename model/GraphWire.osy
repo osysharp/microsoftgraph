@@ -1,0 +1,182 @@
+// Microsoft Graph on the wire. JSON both ways, camelCase, so each field says its own external name where it
+// differs from the Osy# spelling.
+namespace Osysharp.MicrosoftGraph;
+
+/// A person, as Graph knows them. What `/me` answers, and the cheapest call there is — which makes it the right
+/// probe for "is this token any good?".
+public class GraphUser {
+  [ExternalName("id")] public string? Id;
+  [ExternalName("displayName")] public string? DisplayName;
+  /// ⚠ `userPrincipalName` IS THE SIGN-IN NAME, and `mail` is the mailbox — they are often the same string and
+  /// often not. A guest, a shared mailbox and an account whose address changed all separate them. Use `Mail` for
+  /// anything you will send to; use `UserPrincipalName` for anything you will look an account up by.
+  [ExternalName("userPrincipalName")] public string? UserPrincipalName;
+  [ExternalName("mail")] public string? Mail;
+}
+
+/// One message. Narrowed to the fields a list view and a reply need — Graph returns far more, and a kit that
+/// mirrored all of it would be a schema dump rather than a surface.
+public class GraphMessage {
+  [ExternalName("id")] public string? Id;
+  [ExternalName("subject")] public string? Subject;
+  [ExternalName("bodyPreview")] public string? BodyPreview;
+  [ExternalName("receivedDateTime")] public string? ReceivedDateTime;
+  [ExternalName("isRead")] public bool IsRead = false;
+  [ExternalName("from")] public GraphRecipient? From;
+}
+
+/// An address, in the shape Graph nests it — `{ "emailAddress": { "address": …, "name": … } }`. The wrapper is
+/// not decoration: Graph uses the same shape for `from`, `toRecipients`, `organizer` and `attendees`.
+public class GraphRecipient {
+  [ExternalName("emailAddress")] public GraphEmailAddress? EmailAddress;
+}
+
+public class GraphEmailAddress {
+  [ExternalName("address")] public string? Address;
+  [ExternalName("name")] public string? Name;
+}
+
+/// A body, which Graph tags with its own content type rather than inferring it.
+public class GraphItemBody {
+  /// `text` or `html`. ⚠ Sending HTML tagged `text` shows the markup to the reader; sending text tagged `html`
+  /// eats the line breaks. There is no autodetection and the wrong one is not an error.
+  [ExternalName("contentType")] public string ContentType = "text";
+  [ExternalName("content")] public string Content = "";
+}
+
+/// A calendar event.
+public class GraphEvent {
+  [ExternalName("id")] public string? Id;
+  [ExternalName("subject")] public string? Subject;
+  [ExternalName("start")] public GraphDateTimeZone? Start;
+  [ExternalName("end")] public GraphDateTimeZone? End;
+  [ExternalName("location")] public GraphLocation? Location;
+  [ExternalName("isAllDay")] public bool IsAllDay = false;
+  [ExternalName("webLink")] public string? WebLink;
+}
+
+/// ⛔ A TIME AND ITS ZONE, SEPARATELY — and this is Graph's sharpest trap. `dateTime` carries NO offset
+/// (`"2026-09-27T14:00:00"`), and the zone beside it is what makes it mean anything. Send a UTC instant with a
+/// `timeZone` of the user's own and the meeting lands hours out, with no error anywhere.
+public class GraphDateTimeZone {
+  [ExternalName("dateTime")] public string DateTime = "";
+  /// An IANA or Windows zone id — `"UTC"`, `"Europe/Stockholm"`, `"W. Europe Standard Time"`.
+  [ExternalName("timeZone")] public string TimeZone = "UTC";
+}
+
+public class GraphLocation {
+  [ExternalName("displayName")] public string? DisplayName;
+}
+
+/// A file or folder in a drive.
+public class GraphDriveItem {
+  [ExternalName("id")] public string? Id;
+  [ExternalName("name")] public string? Name;
+  [ExternalName("size")] public long Size = 0;
+  [ExternalName("webUrl")] public string? WebUrl;
+  /// Present on a FILE and absent on a folder — which is how you tell them apart; there is no `isFolder`.
+  [ExternalName("file")] public GraphFileFacet? File;
+}
+
+public class GraphFileFacet {
+  [ExternalName("mimeType")] public string? MimeType;
+}
+
+// ── what comes back around a list ───────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ EVERY GRAPH LIST IS PAGED, AND THE PAGE SIZE IS GRAPH'S CHOICE. `value` holds this page; `@odata.nextLink` is
+/// an ABSOLUTE url for the next one, or absent at the end. Code that reads `value` and stops is correct on a small
+/// mailbox and silently wrong on a real one — which is why the client hands the link back rather than hiding it.
+public class GraphMessagePage {
+  [ExternalName("value")] public List<GraphMessage> Value = [];
+  [ExternalName("@odata.nextLink")] public string? NextLink;
+}
+
+public class GraphEventPage {
+  [ExternalName("value")] public List<GraphEvent> Value = [];
+  [ExternalName("@odata.nextLink")] public string? NextLink;
+}
+
+public class GraphDriveItemPage {
+  [ExternalName("value")] public List<GraphDriveItem> Value = [];
+  [ExternalName("@odata.nextLink")] public string? NextLink;
+}
+
+// ── what goes up ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// `POST /me/sendMail` takes the message WRAPPED, not bare.
+public class GraphSendMailRequest {
+  [ExternalName("message")] public GraphOutgoingMessage Message = new GraphOutgoingMessage();
+  /// Whether the sent copy lands in Sent Items. Graph defaults this to false, which surprises everyone: the mail
+  /// goes, and the sender has no record of it. This kit defaults it to true.
+  [ExternalName("saveToSentItems")] public bool SaveToSentItems = true;
+}
+
+public class GraphOutgoingMessage {
+  [ExternalName("subject")] public string Subject = "";
+  [ExternalName("body")] public GraphItemBody Body = new GraphItemBody();
+  [ExternalName("toRecipients")] public List<GraphRecipient> ToRecipients = [];
+  [ExternalName("ccRecipients")] public List<GraphRecipient> CcRecipients = [];
+}
+
+/// `POST /me/events`.
+public class GraphCreateEventRequest {
+  [ExternalName("subject")] public string Subject = "";
+  [ExternalName("body")] public GraphItemBody? Body;
+  [ExternalName("start")] public GraphDateTimeZone Start = new GraphDateTimeZone();
+  [ExternalName("end")] public GraphDateTimeZone End = new GraphDateTimeZone();
+  [ExternalName("location")] public GraphLocation? Location;
+  [ExternalName("attendees")] public List<GraphAttendee> Attendees = [];
+}
+
+public class GraphAttendee {
+  [ExternalName("emailAddress")] public GraphEmailAddress EmailAddress = new GraphEmailAddress();
+  /// `required` · `optional` · `resource`.
+  [ExternalName("type")] public string Type = "required";
+}
+
+/// What Graph says when it refuses — always this shape, whatever the workload.
+public class GraphErrorEnvelope {
+  [ExternalName("error")] public GraphError? Error;
+}
+
+public class GraphError {
+  /// A stable symbolic code — `ErrorAccessDenied`, `InvalidAuthenticationToken`, `ErrorItemNotFound`. Worth
+  /// branching on; the message is not.
+  [ExternalName("code")] public string? Code;
+  [ExternalName("message")] public string? Message;
+}
+
+
+// ── upload sessions, for anything over 4 MB ─────────────────────────────────────────────────────────────────────
+
+/// What `POST /me/drive/root:/{path}:/createUploadSession` answers.
+public class GraphUploadSession {
+  /// ⭐ A PRE-AUTHORISED URL, AND IT CARRIES ITS OWN CREDENTIAL. Chunk PUTs go here with NO `Authorization` header —
+  /// sending one is an error rather than harmless belt-and-braces, because the URL's embedded token is the auth and
+  /// Graph rejects a request carrying both.
+  [ExternalName("uploadUrl")] public string? UploadUrl;
+  [ExternalName("expirationDateTime")] public string? ExpirationDateTime;
+}
+
+// ── change notifications ───────────────────────────────────────────────────────────────────────────────────────
+
+/// A subscription — Graph calling YOU when something changes, instead of you polling.
+public class GraphSubscription {
+  [ExternalName("id")] public string? Id;
+  /// `created,updated,deleted` — comma-separated, no spaces.
+  [ExternalName("changeType")] public string ChangeType = "created,updated";
+  /// The Graph path being watched — `/me/messages`, `/me/events`, `/users/{id}/drive/root`.
+  [ExternalName("resource")] public string Resource = "";
+  /// YOUR endpoint. ⛔ Graph POSTs a VALIDATION TOKEN to it before the subscription is created and expects it echoed
+  /// back within 10 seconds, as `text/plain`. An endpoint that does not do that cannot be subscribed at all — which
+  /// is the first thing that goes wrong and reads as "Graph rejected my URL".
+  [ExternalName("notificationUrl")] public string NotificationUrl = "";
+  /// ⚠ UTC, ISO-8601, and BOUNDED PER RESOURCE — about 3 days for mail and calendar, under an hour for presence.
+  /// Graph refuses one past its own ceiling rather than shortening it, and a subscription that lapses stops
+  /// delivering silently. Renew before it expires.
+  [ExternalName("expirationDateTime")] public string ExpirationDateTime = "";
+  /// Echoed on every notification, so your endpoint can tell that a delivery is one it asked for. Not a security
+  /// boundary on its own — anybody who learns the URL can post to it — but it is the cheap first check.
+  [ExternalName("clientState")] public string? ClientState;
+}

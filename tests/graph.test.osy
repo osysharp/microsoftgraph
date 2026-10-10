@@ -1,0 +1,315 @@
+using Osysharp.MicrosoftGraph;
+using Osysharp.Http;
+
+// Osysharp.MicrosoftGraph — the arithmetic and the refusals, which is what a kit is FOR. The wire shapes come from Graph's
+// own reference; what these cases hold is everything this kit decides on the caller's behalf.
+
+GraphClient Client() { return new GraphClient { AccessToken = "test-token" }; }
+
+/// Exactly one 320 KiB chunk. Hoisted because a nested `Text.ToBytes(Text.Repeat(…))` is not a supported call form in
+/// a test body — the compiler names it and asks for a helper, which is what this is.
+byte[] OneAlignedChunk() {
+  var filler = Text.Repeat("x", 327680);
+  return Text.ToBytes(filler);
+}
+
+// ── what goes on the wire ───────────────────────────────────────────────────────────────────────────────────────
+
+[Test]
+void the_token_is_sent_as_a_BEARER_credential() {
+  // ⭐ THE CASE A CREDENTIAL-CARRYING KIT MOST NEEDS, and it costs three lambda parameters. `Http.*.Stub` takes
+  //    `(url)`, `(url, body)` or `(url, body, headers)` — the third is a `Map<string, string>` of what actually
+  //    went out. Stopping at two binds the second name to the BODY, which is how I first convinced myself the
+  //    headers were unreachable; the refusal says the arity plainly and I had not read it.
+  List<string> sent = [];
+  Http.Get.Stub((url, body, headers) => {
+    sent.Add(headers["Authorization"]);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"u1\",\"displayName\":\"Ada\"}" };
+  });
+
+  Client().Me();
+
+  Assert.Equal("Bearer test-token", sent[0]);
+}
+
+[Test]
+void the_token_that_goes_out_is_WHATEVER_THE_CALLER_SUPPLIED() {
+  // ⛔ THE PER-USER GUARANTEE, END TO END AND IN OSY#. The kit reads no secret; it sends the field it was given.
+  //    So an app whose `GraphToken` is `UserScoped` sends the CALLER's token for the same line of code — and the
+  //    thing this case pins is the half the kit is responsible for: the field reaches the wire unchanged.
+  List<string> sent = [];
+  Http.Get.Stub((url, body, headers) => {
+    sent.Add(headers["Authorization"]);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"u1\"}" };
+  });
+
+  new GraphClient { AccessToken = "alices-delegated-token" }.Me();
+  new GraphClient { AccessToken = "bobs-delegated-token" }.Me();
+
+  Assert.Equal("Bearer alices-delegated-token", sent[0]);
+  Assert.Equal("Bearer bobs-delegated-token", sent[1]);
+}
+
+[Test]
+void send_mail_wraps_the_message_and_saves_to_sent_items_by_default() {
+  // ⛔ THE DEFAULT GRAPH GETS BACKWARDS. `saveToSentItems` defaults to FALSE at the API, so a correct-looking
+  //    integration sends mail the user has no record of ever sending. This kit flips it.
+  // ⚑ A LIST, because an Osy# lambda captures by VALUE — assigning to an outer `string` inside a stub writes into
+  //   a frame that is discarded, and the compiler says so. Every kit's tests capture this way.
+  List<string> posted = [];
+  Http.Post.Stub((url, sent) => { posted.Add(sent); return new HttpResponse { StatusCode = 202, Body = "" }; });
+
+  Client().SendMail("Hello", "Body text", ["ada@test"]);
+
+  Assert.Contains("\"saveToSentItems\":true", posted[0]);
+  Assert.Contains("\"message\"", posted[0]);                 // wrapped, not bare
+  Assert.Contains("\"address\":\"ada@test\"", posted[0]);
+  Assert.Contains("\"contentType\":\"text\"", posted[0]);
+}
+
+[Test]
+void html_is_TAGGED_html_because_the_wrong_tag_is_not_an_error() {
+  // Sending HTML tagged `text` shows the markup to the reader. Graph does not detect it and does not complain.
+  // ⚑ A LIST, because an Osy# lambda captures by VALUE — assigning to an outer `string` inside a stub writes into
+  //   a frame that is discarded, and the compiler says so. Every kit's tests capture this way.
+  List<string> posted = [];
+  Http.Post.Stub((url, sent) => { posted.Add(sent); return new HttpResponse { StatusCode = 202, Body = "" }; });
+
+  Client().SendMail("Hi", "<p>Hi</p>", ["ada@test"], true);
+
+  Assert.Contains("\"contentType\":\"html\"", posted[0]);
+}
+
+// ── the refusals, each naming what to do ────────────────────────────────────────────────────────────────────────
+
+[Test]
+void a_mail_with_no_recipients_is_refused_before_it_is_sent() {
+  // Graph ACCEPTS an empty `toRecipients` and delivers to nobody — a 202 for a mail that went nowhere, which is
+  // indistinguishable from success everywhere downstream.
+  var fault = Assert.Throws<ExternalServiceException>(() => Client().SendMail("Subject", "Body", []));
+
+  Assert.Contains("at least one recipient", fault.Message);
+  Assert.Contains("delivers to nobody", fault.Message);
+}
+
+[Test]
+void a_file_over_four_megabytes_is_refused_by_NAME_rather_than_becoming_a_413() {
+  var big = Text.ToBytes(Text.Repeat("x", 4000001));
+
+  var fault = Assert.Throws<ExternalServiceException>(() => Client().UploadSmallFile("report.pdf", big));
+
+  Assert.Contains("report.pdf", fault.Message);
+  Assert.Contains("4 MB", fault.Message);
+  Assert.Contains("upload session", fault.Message);      // …and what the larger path is called
+}
+
+// ── the failures Graph explains badly ───────────────────────────────────────────────────────────────────────────
+
+[Test]
+void a_401_says_it_is_the_TOKEN_and_a_403_says_it_is_the_PERMISSION() {
+  // ⭐ THE MOST VALUABLE SENTENCE IN THIS KIT. The two codes look alike and mean completely different work: 401 is
+  //    re-acquire the token, 403 is change consent in Entra ID. Reading the number alone costs an hour.
+  Http.Get.Stub((url) => new HttpResponse {
+    StatusCode = 401,
+    Body = "{\"error\":{\"code\":\"InvalidAuthenticationToken\",\"message\":\"Access token has expired.\"}}",
+  });
+  var unauthorized = Assert.Throws<ExternalServiceException>(() => Client().Me());
+  Assert.Contains("InvalidAuthenticationToken", unauthorized.Message);
+  Assert.Contains("a 401 is the TOKEN", unauthorized.Message);
+  Assert.Contains("granting scopes will not help", unauthorized.Message);
+
+  Http.Get.Stub((url) => new HttpResponse {
+    StatusCode = 403,
+    Body = "{\"error\":{\"code\":\"ErrorAccessDenied\",\"message\":\"Access is denied.\"}}",
+  });
+  var forbidden = Assert.Throws<ExternalServiceException>(() => Client().Me());
+  Assert.Contains("a 403 is the PERMISSION", forbidden.Message);
+  Assert.Contains("consent change in Entra ID", forbidden.Message);
+}
+
+[Test]
+void throttling_says_to_back_off_rather_than_retrying_immediately() {
+  Http.Get.Stub((url) => new HttpResponse { StatusCode = 429, Body = "" });
+
+  var fault = Assert.Throws<ExternalServiceException>(() => Client().Me());
+
+  Assert.Contains("throttling", fault.Message);
+  Assert.Contains("Retry-After", fault.Message);
+}
+
+// ── paging, which is where a Graph integration is usually wrong ─────────────────────────────────────────────────
+
+[Test]
+void a_list_hands_back_its_next_link_rather_than_pretending_one_page_is_everything() {
+  Http.Get.Stub((url) => new HttpResponse {
+    StatusCode = 200,
+    Body = "{\"value\":[{\"id\":\"m1\",\"subject\":\"One\"}],"
+         + "\"@odata.nextLink\":\"https://graph.microsoft.com/v1.0/me/messages?$skiptoken=abc\"}",
+  });
+
+  var page = Client().Inbox();
+
+  Assert.Equal(1, page.Value.Count);
+  Assert.Equal("One", page.Value[0].Subject);
+  Assert.NotNull(page.NextLink);
+}
+
+[Test]
+void the_next_link_is_used_AS_GIVEN_never_prefixed_with_the_base_url() {
+  // ⛔ THE LOOP THIS PREVENTS. The link is absolute and carries an opaque skip token. Prefixing `BaseUrl` to it
+  //    produces a doubled host that 404s, and rebuilding the query drops the token — which silently restarts from
+  //    page one and iterates forever.
+  List<string> requested = [];
+  Http.Get.Stub((url) => {
+    requested.Add(url);
+    return new HttpResponse { StatusCode = 200, Body = "{\"value\":[]}" };
+  });
+
+  Client().NextMessagePage("https://graph.microsoft.com/v1.0/me/messages?$skiptoken=abc");
+
+  Assert.Equal("https://graph.microsoft.com/v1.0/me/messages?$skiptoken=abc", requested[0]);
+}
+
+[Test]
+void the_calendar_reads_the_VIEW_so_a_recurring_meeting_appears_on_each_day_it_falls_on() {
+  // ⛔ `/calendarView`, NOT `/events`. `/events` answers the SERIES — one row however often it repeats — so "what
+  //    is on Tuesday" comes back empty for a weekly stand-up. Reading the wrong one is the commonest Graph
+  //    calendar bug and it looks like missing data, not like a wrong URL.
+  List<string> requested = [];
+  Http.Get.Stub((url) => {
+    requested.Add(url);
+    return new HttpResponse { StatusCode = 200, Body = "{\"value\":[]}" };
+  });
+
+  Client().Calendar("2026-09-27T00:00:00Z", "2026-09-28T00:00:00Z");
+
+  Assert.Contains("/me/calendarView", requested[0]);
+  Assert.Contains("startDateTime=", requested[0]);
+}
+
+[Test]
+void an_event_carries_its_time_ZONE_because_the_dateTime_has_no_offset() {
+  // Graph's `dateTime` is naive. The zone beside it is what fixes the instant; getting it wrong lands the meeting
+  // hours out with no error anywhere.
+  List<string> posted = [];
+  Http.Post.Stub((url, sent) => { posted.Add(sent); return new HttpResponse { StatusCode = 201, Body = "{\"id\":\"e1\"}" }; });
+
+  Client().CreateEvent("Stand-up",
+    new GraphDateTimeZone { DateTime = "2026-09-28T09:00:00", TimeZone = "Europe/Stockholm" },
+    new GraphDateTimeZone { DateTime = "2026-09-28T09:15:00", TimeZone = "Europe/Stockholm" });
+
+  Assert.Contains("\"timeZone\":\"Europe/Stockholm\"", posted[0]);
+  Assert.Contains("\"dateTime\":\"2026-09-28T09:00:00\"", posted[0]);
+}
+
+// ── the three gaps that were listed as not covered, now covered ─────────────────────────────────────────────────
+
+
+
+
+[Test]
+void a_filter_is_applied_by_GRAPH_not_by_the_caller_discarding_rows() {
+  // ⛔ THE MOST EXPENSIVE MISTAKE IN A GRAPH INTEGRATION: fetching pages and throwing rows away locally pays for
+  //    every row — in bandwidth and in throttling budget — to keep a few.
+  List<string> asked = [];
+  Http.Get.Stub((url, body, headers) => {
+    asked.Add(url);
+    return new HttpResponse { StatusCode = 200, Body = "{\"value\":[]}" };
+  });
+
+  Client().InboxWhere("isRead eq false");
+
+  // ⚠ THE KEY IS LITERAL `$filter`, and only the VALUE is escaped. OData's `$` prefixes are reserved names Graph
+  //   matches verbatim — percent-encoding one would make it an unknown parameter, silently ignored.
+  Assert.Contains("$filter=", asked[0]);
+  Assert.Contains("isRead%20eq%20false", asked[0]);
+}
+
+[Test]
+void select_narrows_what_comes_back_and_is_omitted_when_not_asked_for() {
+  List<string> asked = [];
+  Http.Get.Stub((url, body, headers) => {
+    asked.Add(url);
+    return new HttpResponse { StatusCode = 200, Body = "{\"value\":[]}" };
+  });
+
+  Client().Inbox(10, "subject,from");
+  Client().Inbox(10);
+
+  Assert.Contains("$select=subject%2Cfrom", asked[0]);
+  Assert.DoesNotContain("select", asked[1]);   // Graph's default projection, rather than an empty one
+}
+
+[Test]
+void a_subscription_carries_its_expiry_because_one_that_lapses_stops_delivering_SILENTLY() {
+  List<string> posted = [];
+  Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 201, Body = "{\"id\":\"s1\"}" }; });
+
+  var sub = Client().Subscribe("/me/messages", "https://app.example/hook", "2026-09-30T00:00:00Z", "created", "shh");
+
+  Assert.Equal("s1", sub.Id);
+  Assert.Contains("\"expirationDateTime\":\"2026-09-30T00:00:00Z\"", posted[0]);
+  Assert.Contains("\"resource\":\"/me/messages\"", posted[0]);
+  Assert.Contains("\"clientState\":\"shh\"", posted[0]);
+}
+
+// ── the chunked upload ──────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test]
+void a_large_upload_sends_ALIGNED_chunks_with_an_INCLUSIVE_content_range() {
+  // ⛔ TWO RULES GRAPH ENFORCES AND DOES NOT EXPLAIN: a chunk must be a multiple of 320 KiB, and `Content-Range`'s
+  //    END IS INCLUSIVE — the off-by-one everybody writes once, which Graph reports as a byte range rather than a
+  //    rule.
+  List<string> ranges = [];
+  Http.Post.Stub((url, body) => new HttpResponse {
+    StatusCode = 200, Body = "{\"uploadUrl\":\"https://upload.example/session/abc\"}",
+  });
+  Http.Put.Stub((url, body, headers) => {
+    ranges.Add(headers["Content-Range"]);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"f1\",\"name\":\"big.bin\"}" };
+  });
+
+  var item = Client().UploadLargeFile("big.bin", OneAlignedChunk(), 327680);
+
+  Assert.Equal("f1", item.Id);
+  Assert.Equal("bytes 0-327679/327680", ranges[0]);
+}
+
+[Test]
+void the_chunk_PUT_carries_NO_authorization_header_because_the_session_url_IS_the_credential() {
+  // ⛔ THE SINGLE MOST COMMON WAY A CORRECT-LOOKING SESSION UPLOAD FAILS. `uploadUrl` is pre-authorised — the
+  //    credential is in the URL — and Graph REJECTS a chunk that also presents a bearer token. Sending one is not
+  //    harmless belt-and-braces.
+  List<string> saw = [];
+  Http.Post.Stub((url, body) => new HttpResponse {
+    StatusCode = 200, Body = "{\"uploadUrl\":\"https://upload.example/session/abc\"}",
+  });
+  Http.Put.Stub((url, body, headers) => {
+    saw.Add(headers.ContainsKey("Authorization") ? "HAS-AUTH" : "no-auth");
+    saw.Add(headers.ContainsKey("Content-Range") ? "HAS-RANGE" : "no-range");
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"f1\"}" };
+  });
+
+  Client().UploadLargeFile("big.bin", OneAlignedChunk(), 327680);
+
+  Assert.Contains("no-auth", saw);
+  Assert.Contains("HAS-RANGE", saw);
+}
+
+[Test]
+void a_misaligned_chunk_size_is_refused_by_ARITHMETIC_rather_than_by_graph() {
+  var fault = Assert.Throws<ExternalServiceException>(() =>
+    Client().UploadLargeFile("big.bin", OneAlignedChunk(), 300000));
+
+  Assert.Contains("320 KiB", fault.Message);
+  Assert.Contains("327680", fault.Message);
+}
+
+[Test]
+void an_empty_file_is_refused_because_graph_has_no_zero_byte_session() {
+  var fault = Assert.Throws<ExternalServiceException>(() =>
+    Client().UploadLargeFile("empty.bin", Text.ToBytes(""), 327680));
+
+  Assert.Contains("is empty", fault.Message);
+  Assert.Contains("UploadSmallFile", fault.Message);   // …and what to use instead
+}

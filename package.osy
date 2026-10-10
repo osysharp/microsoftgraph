@@ -1,0 +1,50 @@
+// Osysharp.MicrosoftGraph — Microsoft 365 through Microsoft Graph: mail, calendar and files.
+//
+// ⭐ A KIT WHOSE CREDENTIAL IS THE CALLER'S — a `UserScoped` secret. Stripe has one merchant key; Klarna has one. Graph is per-user by nature — "read MY calendar", "send
+//    as ME" — and the app holds a different token for every person who has connected their account.
+//
+// ⛔ TWO MODES, AND CONFLATING THEM IS AN INCIDENT. Graph answers the SAME URL differently depending on which
+//    credential you present:
+//      · DELEGATED — acting as the signed-in user, over what they can see. `GET /me/messages` is THEIR mail.
+//      · APPLICATION — acting as the app across the whole tenant, with admin consent. `GET /users/{id}/messages`
+//        is ANYONE's mail.
+//    This kit does not choose for you and cannot: the choice is made by how the app declares its secret, which is
+//    the one place it is visible to a reviewer.
+//
+//      app.Secrets = [ new Secret("GraphToken") { UserScoped = true } ];   // delegated — per person
+//      app.Secrets = [ new Secret("GraphToken") ];                         // application — one tenant-wide token
+//
+//    Both are then read by the same line, `new GraphClient { AccessToken = Secret.GraphToken }`, and the platform
+//    resolves it against the caller or the app according to that declaration. Nothing in this package can tell the
+//    difference, and nothing in it needs to.
+package Osysharp.MicrosoftGraph {
+  version "0.1.1";
+  minPlatform "0.9.0";
+  contract    "1.1";
+  summary     "Microsoft 365 through Graph — mail, calendar and files, as the signed-in user or as the app.";
+
+  model "model/*.osy";
+  use Osysharp.Http;
+
+  // ⚠ ONE HOST FOR THE API ITSELF. Graph is a single endpoint for every workload, which is unusually easy to grant
+  //   precisely — the login host that MINTS the token is not here, because this kit never mints one: it is handed one.
+  egress "graph.microsoft.com";
+
+  // ⛔ AND AN UPLOAD SESSION GOES SOMEWHERE ELSE, which is not obvious until the first large file fails. Graph answers
+  //    `createUploadSession` with an `uploadUrl` on a host IT chooses — `*.up.1drv.com`, a tenant's
+  //    `*.sharepoint.com`, or another — and the chunk PUTs go there, not to `graph.microsoft.com`. The kit cannot
+  //    name it: it is per-tenant and per-session.
+  //
+  // ⭐ SO IT IS THE CONSUMER'S TO GRANT, which is exactly what `egress consumer;` is for (`Osysharp.Payments.Klarna` uses it
+  //    for the same reason — an endpoint the app chooses). An app that never calls `UploadLargeFile` grants nothing
+  //    extra; one that does adds the host its own tenant answers with, and the leash names it the first time.
+  //
+  // ⚑ That is why the kit's test app grants `upload.example`: without the grant an upload there is refused, and the
+  //   refusal spells out the grant to add — a package reaching a host nobody allowed is exactly what egress stops.
+  egress consumer;
+
+  // The OAuth access token. Declared as a secret so the app decides its scope — see the block above.
+  secret "GraphToken";
+
+  tests "tests";
+}

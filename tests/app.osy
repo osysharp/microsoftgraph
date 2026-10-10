@@ -1,0 +1,23 @@
+// The producer's test project for Osysharp.MicrosoftGraph. It does not ship; `osy publish` runs it and refuses a version
+// that fails.
+//
+// ⚑ IT CONSUMES THE KIT AS A PACKAGE, exactly as a real app does — `use Osysharp.MicrosoftGraph@0 { … }` with the grants
+//   spelled out — rather than globbing `../model`. That way the test project proves the GRANT surface too: a kit
+//   whose declared needs an app cannot satisfy would fail here, before anyone downloaded it.
+app GraphKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+
+  use Osysharp.MicrosoftGraph@0 {
+    egress "graph.microsoft.com";
+    // …and the upload host, which the kit declares as the consumer's to name because Graph chooses it per session.
+    // A real app grants whatever its own tenant answers with; this one grants the host its stubs pretend to be.
+    egress "upload.example";
+    secret "GraphToken";
+  }
+  use Osysharp.Http;
+}
+
+// App-scoped here, because these cases are about the kit's own arithmetic rather than about whose token it is.
+// The per-user half is proved where it lives — in the platform's own tests.
+app.Secrets = [ new Secret("GraphToken") ];

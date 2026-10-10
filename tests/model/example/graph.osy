@@ -1,0 +1,21 @@
+// EXAMPLE — the smallest working shape of Microsoft 365 in an app: one factory that spends the token, and two
+// calls. osyrin.com/integrations/ shows this file; it compiles with the kit's own test app, so it cannot drift.
+using Osysharp.MicrosoftGraph;
+
+// app.osy declares the secret. `{ UserScoped = true }` makes it the SIGNED-IN PERSON's token, so Graph()
+// acts as whoever is calling — their mail, their calendar. Without it, one token acts as the app.
+//   app.Secrets = [ new Secret("GraphToken") { UserScoped = true } ];
+
+/// The one place the token is spent. It compiles because nothing can read AccessToken back out of
+/// what it returns: the client passes between your functions, never to a log, a row or a page.
+GraphClient Graph() { return new GraphClient { AccessToken = Secret.GraphToken }; }
+
+/// A mail that comes FROM the person, not from a no-reply address — and lands in their Sent Items.
+void SendInvoice(string email, string reference) {
+  Graph().SendMail($"Invoice {reference}", "Attached, with thanks.", [email]);
+}
+
+/// The week ahead — the calendar VIEW, so a recurring meeting appears on each day it falls on.
+List<GraphEvent> WeekAhead(string fromUtc, string toUtc) {
+  return Graph().Calendar(fromUtc, toUtc).Value;
+}

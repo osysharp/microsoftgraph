@@ -1,0 +1,310 @@
+namespace Osysharp.MicrosoftGraph;
+
+using Osysharp.Http;
+
+/// Microsoft 365 through Graph.
+///
+/// ⭐ THE TOKEN IS A FIELD, AND THAT IS THE WHOLE PER-USER STORY. This class never reads a secret; the app hands it
+/// one, so the app decides whose it is:
+///
+/// ```osy
+/// GraphClient Graph() { return new GraphClient { AccessToken = Secret.GraphToken }; }
+/// string MySubject() { return Graph().Inbox(1).Value[0].Subject; }
+/// ```
+///
+/// ⭐ ONE FACTORY. The compiler notes that the credential field was assigned a
+/// secret, so the object may be returned and passed between your functions while the FIELD cannot be read back out —
+/// returned, logged, stored, copied or sent to a page. A component holding the client is refused (an object reaches the
+/// browser with its fields), and so is invoking the factory from a request.
+///
+/// Declare `new Secret("GraphToken") { UserScoped = true }` and that same line resolves the CALLER's token —
+/// delegated, "as me". Declare it without `UserScoped` and it resolves the app's — application mode, tenant-wide.
+/// One line of app source is the whole difference, and it sits where a reviewer reads it.
+///
+/// ⛔ THIS KIT DOES NOT MINT TOKENS, and that is deliberate rather than missing. Acquiring one is an OAuth flow the
+/// platform already owns (`app.OAuthClients`, `osy docs config-oauth-clients`) — a second implementation here would
+/// be a second place for a refresh bug to live. What this kit does is SPEND a token correctly.
+public class GraphClient {
+  /// The OAuth access token, supplied by the caller. See the class note for how its scope is chosen.
+  public string AccessToken = "";
+  /// The API root. `v1.0` is the supported surface; `beta` exists and is explicitly not stable — point here only
+  /// if you have read what changes.
+  public string BaseUrl = "https://graph.microsoft.com/v1.0";
+
+  // ── who am I ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// The signed-in user. ⭐ THE RIGHT FIRST CALL when something is wrong: it needs no scope beyond `User.Read`, so a
+  /// 401 here is the token and a 403 on a later call is the permission — a distinction that otherwise costs an hour.
+  ///
+  /// ⚠ IN APPLICATION MODE THERE IS NO `/me` AND THIS WILL FAIL — correctly. An app-only token belongs to no user,
+  /// so Graph answers `BadRequest` rather than guessing. Use `UserByUpn` instead.
+  public GraphUser Me() {
+    return JsonSerializer.Deserialize<GraphUser>(Get("/me"));
+  }
+
+  /// One user by their sign-in name or id — the APPLICATION-mode counterpart of `Me`.
+  public GraphUser UserByUpn(string upnOrId) {
+    return JsonSerializer.Deserialize<GraphUser>(Get("/users/" + Uri.EscapeDataString(upnOrId)));
+  }
+
+  // ── mail ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// The newest messages in the inbox, newest first.
+  ///
+  /// ⚠ ONE PAGE. `Page.NextLink` is the rest, and it is Graph that decides how big a page is — not `top`, which is
+  /// a ceiling rather than a promise. Pass the link to `NextMessagePage` until it comes back null.
+  /// `fields` narrows what comes back — `"subject,from,receivedDateTime"`. ⭐ WORTH PASSING, AND NOT ONLY FOR SIZE:
+  /// Graph's default message projection is large, and a mailbox list that drags `body` across the wire for every row
+  /// is the difference between a page that loads and one that does not. Omit it and you get Graph's default set.
+  public GraphMessagePage Inbox(int top = 25, string? fields = null) {
+    var url = "/me/mailFolders/inbox/messages?$top=" + top + "&$orderby=receivedDateTime%20desc";
+    if (fields != null) { url = url + "&$select=" + Uri.EscapeDataString(fields); }
+    return JsonSerializer.Deserialize<GraphMessagePage>(Get(url));
+  }
+
+  /// The inbox, filtered by Graph rather than by you. `filter` is OData — `"isRead eq false"`,
+  /// `"from/emailAddress/address eq 'a@b.c'"`.
+  ///
+  /// ⛔ FILTER AT THE SERVER OR NOT AT ALL. Fetching pages and discarding rows locally is the single most expensive
+  /// mistake in a Graph integration: it pays for every row, in bandwidth and in throttling budget, to keep a few.
+  /// An unread-only inbox is one parameter here and a paging loop the other way.
+  ///
+  /// ⚠ `$filter` AND `$orderby` TOGETHER ARE OFTEN REFUSED on messages — Graph requires an index that covers both and
+  /// answers `InefficientFilter` when there is none. That is why this overload does not order: get the filter working
+  /// first, then add ordering only if Graph accepts it.
+  public GraphMessagePage InboxWhere(string filter, int top = 25) {
+    return JsonSerializer.Deserialize<GraphMessagePage>(
+      Get("/me/mailFolders/inbox/messages?$top=" + top + "&$filter=" + Uri.EscapeDataString(filter)));
+  }
+
+  /// The next page of messages, from a `NextLink` a previous page handed back.
+  ///
+  /// ⛔ THE LINK IS ABSOLUTE AND ALREADY CARRIES ITS QUERY — including a skip token that is opaque and must not be
+  /// rebuilt. It is used AS GIVEN; prefixing `BaseUrl` to it, or re-encoding it, is how paging quietly restarts
+  /// from the first page and loops forever.
+  public GraphMessagePage NextMessagePage(string nextLink) {
+    var r = Http.Get(nextLink, Headers());
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure("next page", r)); }
+    return JsonSerializer.Deserialize<GraphMessagePage>(r.Body);
+  }
+
+  /// Send a mail as the token's owner. Answers nothing: Graph accepts it (202) and delivers asynchronously, so
+  /// there is no message id to hand back — a send that returns successfully has been QUEUED, not delivered.
+  public void SendMail(string subject, string body, List<string> to, bool html = false) {
+    if (to.Count == 0) {
+      throw new ExternalServiceException("SendMail needs at least one recipient — Graph accepts an empty "
+        + "`toRecipients` and delivers to nobody, which is the same as the call never having run.");
+    }
+
+    var message = new GraphOutgoingMessage {
+      Subject = subject,
+      Body = new GraphItemBody { ContentType = html ? "html" : "text", Content = body },
+    };
+    foreach (var address in to) {
+      message.ToRecipients.Add(new GraphRecipient { EmailAddress = new GraphEmailAddress { Address = address } });
+    }
+
+    Post("/me/sendMail", JsonSerializer.Serialize(new GraphSendMailRequest { Message = message }, JsonOptions()));
+  }
+
+  // ── calendar ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Events between two instants, as the calendar VIEW — which is the one that expands recurrences.
+  ///
+  /// ⛔ `/calendarView` RATHER THAN `/events`, AND THE DIFFERENCE IS NOT A DETAIL. `/events` answers the SERIES for
+  /// a recurring meeting — one row, whatever it repeats — so a weekly stand-up appears once and "what is on
+  /// Tuesday" comes back empty. `/calendarView` expands occurrences across the window, which is what anyone asking
+  /// about a date range means.
+  ///
+  /// `startUtc`/`endUtc` are ISO-8601 instants (`2026-09-27T00:00:00Z`).
+  public GraphEventPage Calendar(string startUtc, string endUtc) {
+    return JsonSerializer.Deserialize<GraphEventPage>(
+      Get("/me/calendarView?startDateTime=" + Uri.EscapeDataString(startUtc)
+        + "&endDateTime=" + Uri.EscapeDataString(endUtc) + "&$orderby=start/dateTime"));
+  }
+
+  /// Put an event in the calendar. Answers the created event, whose `Id` is the handle for changing or cancelling
+  /// it later and whose `WebLink` opens it in Outlook.
+  ///
+  /// ⚠ `timeZone` IS NOT OPTIONAL AND NOT COSMETIC — see `GraphDateTimeZone`. A `dateTime` carries no offset, so
+  /// the zone beside it is what fixes the instant. The default here is UTC, which is right if your times are UTC
+  /// and hours wrong if they are local.
+  public GraphEvent CreateEvent(string subject, GraphDateTimeZone start, GraphDateTimeZone end,
+                                string? location = null, List<string>? attendees = null) {
+    var request = new GraphCreateEventRequest { Subject = subject, Start = start, End = end };
+    if (location != null) { request.Location = new GraphLocation { DisplayName = location }; }
+    foreach (var address in attendees ?? []) {
+      request.Attendees.Add(new GraphAttendee { EmailAddress = new GraphEmailAddress { Address = address } });
+    }
+
+    return JsonSerializer.Deserialize<GraphEvent>(
+      Post("/me/events", JsonSerializer.Serialize(request, JsonOptions())));
+  }
+
+  // ── files ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// What is in a OneDrive folder. `""` is the root.
+  public GraphDriveItemPage Files(string folderPath = "") {
+    var path = folderPath == ""
+      ? "/me/drive/root/children"
+      : "/me/drive/root:/" + folderPath + ":/children";
+    return JsonSerializer.Deserialize<GraphDriveItemPage>(Get(path));
+  }
+
+  /// Upload a small file, creating or replacing it. Answers the item.
+  ///
+  /// ⛔ SMALL MEANS UNDER 4 MB, AND GRAPH REFUSES THE REST RATHER THAN TRUNCATING. Anything larger needs an upload
+  /// SESSION (`createUploadSession`, chunked) which is a different shape and is not in this kit — so the limit is
+  /// checked here, by name, rather than discovered as a 413 on a file somebody cared about.
+  public GraphDriveItem UploadSmallFile(string path, byte[] content, string contentType = "application/octet-stream") {
+    if (content.Length > 4000000) {
+      throw new ExternalServiceException($"'{path}' is {content.Length} bytes and Graph's simple upload stops at "
+        + "4 MB. Larger files need an upload session (`createUploadSession`), which this kit does not wrap yet.");
+    }
+
+    var r = Http.Put(BaseUrl + "/me/drive/root:/" + path + ":/content", Text.FromBytes(content), contentType, Headers());
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure("upload " + path, r)); }
+    return JsonSerializer.Deserialize<GraphDriveItem>(r.Body);
+  }
+
+  /// Upload a file of ANY size, in chunks, through an upload session. Answers the finished item.
+  ///
+  /// ⭐ THE PATH `UploadSmallFile` REFUSES. Simple upload stops at 4 MB; this is what the rest need, and it is three
+  /// steps rather than one: create a session, PUT ranges, and the LAST range answers the item.
+  ///
+  /// ⚑ EACH CHUNK IS A SLICE: `data.Slice(from, size)` cuts the next range out of the `byte[]` without copying the rest.
+  ///
+  /// ⛔ THE CHUNK PUTS CARRY NO `Authorization` HEADER, and that is not an oversight. The session's `uploadUrl` is
+  /// pre-authorised — the credential is IN the URL — and Graph rejects a chunk that also presents a bearer token.
+  /// This is the single most common way a correct-looking session upload fails.
+  ///
+  /// ⚠ AND A CHUNK MUST BE A MULTIPLE OF 320 KiB (327,680 bytes), every one except the last. Graph does not round for
+  /// you: a 300 KB chunk is refused, and the message names a byte range rather than the rule.
+  public GraphDriveItem UploadLargeFile(string path, byte[] content, int chunkSize = 3276800) {
+    if (content.Length == 0) {
+      throw new ExternalServiceException($"'{path}' is empty — Graph has no zero-byte upload session. Use "
+        + "`UploadSmallFile` for a small or empty file.");
+    }
+    if (chunkSize % 327680 != 0) {
+      throw new ExternalServiceException($"A chunk size must be a multiple of 320 KiB (327680 bytes); {chunkSize} is "
+        + "not. Graph refuses a misaligned range and names the range rather than the rule.");
+    }
+
+    var session = JsonSerializer.Deserialize<GraphUploadSession>(
+      Post("/me/drive/root:/" + path + ":/createUploadSession", "{}"));
+    if (session.UploadUrl == null) {
+      throw new ExternalServiceException($"Graph created no upload session for '{path}' — it answered no uploadUrl.");
+    }
+
+    var total = content.Length;
+    var sent = 0;
+    while (sent < total) {
+      // ⚑ `Slice` CLAMPS, so the last chunk is short by construction and this loop needs no arithmetic to notice the
+      //   end. That is the whole reason the language verb clamps rather than throwing.
+      var chunk = content.Slice(sent, chunkSize);
+      var last = sent + chunk.Length;
+
+      // ⛔ NO `Headers()` HERE — see the note above. Content-Range is what Graph reads to place the bytes, and its
+      //    END IS INCLUSIVE, which is the off-by-one everyone writes once.
+      var ranged = new Dictionary<string, string>();
+      ranged.Add("Content-Range", "bytes " + sent + "-" + (last - 1) + "/" + total);
+
+      var r = Http.Put(session.UploadUrl, Text.FromBytes(chunk), "application/octet-stream", ranged);
+      if (!r.IsSuccess) {
+        throw new ExternalServiceException(Failure($"upload chunk at {sent} of '{path}'", r));
+      }
+
+      sent = last;
+      // 200/201 on the LAST range carries the finished item; 202 means "accepted, send the next".
+      if (sent >= total) { return JsonSerializer.Deserialize<GraphDriveItem>(r.Body); }
+    }
+
+    throw new ExternalServiceException($"The upload of '{path}' sent every byte and Graph never answered an item.");
+  }
+
+  // ── change notifications ────────────────────────────────────────────────────────────────────────────────────
+
+  /// Subscribe to changes on a Graph resource, so Graph calls you instead of you polling.
+  ///
+  /// ⛔ YOUR ENDPOINT MUST ECHO A VALIDATION TOKEN BEFORE THIS CAN SUCCEED. Graph POSTs a `validationToken` query
+  /// parameter to `notificationUrl` and expects it back as `text/plain` within 10 seconds. Until that is built, every
+  /// call here fails on Graph's side and the message reads as if the URL were wrong.
+  ///
+  /// ⚠ AND A SUBSCRIPTION EXPIRES — about 3 days for mail and calendar. Graph refuses an `expiresUtc` past its own
+  /// ceiling rather than shortening it, and one that lapses stops delivering silently, so renewal is not optional.
+  public GraphSubscription Subscribe(string resource, string notificationUrl, string expiresUtc,
+                                     string changeType = "created,updated", string? clientState = null) {
+    var request = new GraphSubscription {
+      Resource = resource, NotificationUrl = notificationUrl,
+      ExpirationDateTime = expiresUtc, ChangeType = changeType, ClientState = clientState,
+    };
+    return JsonSerializer.Deserialize<GraphSubscription>(
+      Post("/subscriptions", JsonSerializer.Serialize(request, JsonOptions())));
+  }
+
+  /// Push a subscription's expiry out. The renewal, which is the half that keeps it alive.
+  public GraphSubscription Renew(string subscriptionId, string expiresUtc) {
+    var body = new GraphSubscription { ExpirationDateTime = expiresUtc };
+    var r = Http.Patch(BaseUrl + "/subscriptions/" + Uri.EscapeDataString(subscriptionId),
+                       JsonSerializer.Serialize(body, JsonOptions()), "application/json", Headers());
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure("renew subscription", r)); }
+    return JsonSerializer.Deserialize<GraphSubscription>(r.Body);
+  }
+
+  // ── the plumbing ────────────────────────────────────────────────────────────────────────────────────────────
+
+  string Get(string path) {
+    var r = Http.Get(BaseUrl + path, Headers());
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure("GET " + path, r)); }
+    return r.Body;
+  }
+
+  string Post(string path, string body) {
+    var r = Http.Post(BaseUrl + path, body, "application/json", Headers());
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure("POST " + path, r)); }
+    return r.Body;
+  }
+
+  Dictionary<string, string> Headers() {
+    var headers = new Dictionary<string, string>();
+    headers.Add("Authorization", "Bearer " + AccessToken);
+    return headers;
+  }
+
+  JsonSerializerOptions JsonOptions() {
+    return new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
+  }
+
+  /// What went wrong, in Graph's own words, with the part that is actually actionable put first.
+  ///
+  /// ⭐ THE STATUS CODE ALONE IS THE WRONG THING TO READ, and Graph is the API where this costs most: 401 and 403
+  /// look alike and mean completely different work. 401 is the TOKEN — expired, or minted for the wrong audience.
+  /// 403 is the PERMISSION — the token is fine and the app was never granted the scope, which is a consent change,
+  /// not a code change. The message says which.
+  string Failure(string what, HttpResponse r) {
+    var detail = r.Body;
+    if (r.Body != "") {
+      var envelope = JsonSerializer.Deserialize<GraphErrorEnvelope>(r.Body);
+      if (envelope.Error != null) {
+        detail = envelope.Error.Code != null
+          ? envelope.Error.Code + ": " + (envelope.Error.Message ?? "")
+          : (envelope.Error.Message ?? r.Body);
+      }
+    }
+
+    var hint = "";
+    if (r.StatusCode == 401) {
+      hint = " — a 401 is the TOKEN, not the permission: it has expired, or it was minted for a different audience "
+           + "than graph.microsoft.com. Re-acquire it; granting scopes will not help.";
+    }
+    if (r.StatusCode == 403) {
+      hint = " — a 403 is the PERMISSION, not the token: this one is valid and the app was never granted the scope "
+           + "this call needs. That is a consent change in Entra ID, not a code change.";
+    }
+    if (r.StatusCode == 429) {
+      hint = " — Graph is throttling. Back off and retry; the `Retry-After` header says how long, and retrying "
+           + "immediately makes it last longer.";
+    }
+    return $"Graph {what} failed ({r.StatusCode}): {detail}{hint}";
+  }
+}
