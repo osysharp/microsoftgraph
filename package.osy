@@ -18,8 +18,8 @@
 //    resolves it against the caller or the app according to that declaration. Nothing in this package can tell the
 //    difference, and nothing in it needs to.
 package Osysharp.MicrosoftGraph {
-  version "0.1.1";
-  minPlatform "0.9.0";
+  version "0.2.0";
+  minPlatform "0.14.0";
   contract    "1.1";
   summary     "Microsoft 365 through Graph — mail, calendar and files, as the signed-in user or as the app.";
 
