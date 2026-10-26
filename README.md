@@ -138,3 +138,90 @@ takes `(url, body, headers)`; the third parameter is what actually went out.) Th
 ## Source
 
 `model/` — two files, no C# anywhere. 350 lines for mail, calendar and files.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.MicrosoftGraph;
+using Osysharp.Http;
+
+[Test]
+void the_token_is_sent_as_a_BEARER_credential() {
+  // ⭐ THE CASE A CREDENTIAL-CARRYING KIT MOST NEEDS, and it costs three lambda parameters. `Http.*.Stub` takes
+  //    `(url)`, `(url, body)` or `(url, body, headers)` — the third is a `Map<string, string>` of what actually
+  //    went out. Stopping at two binds the second name to the BODY, which is how I first convinced myself the
+  //    headers were unreachable; the refusal says the arity plainly and I had not read it.
+  List<string> sent = [];
+  Http.Get.Stub((url, body, headers) => {
+    sent.Add(headers["Authorization"]);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"u1\",\"displayName\":\"Ada\"}" };
+  });
+
+  Client().Me();
+
+  Assert.Equal("Bearer test-token", sent[0]);
+}
+```
+
+From [`tests/graph.test.osy`](tests/graph.test.osy).
+
+```osy
+using Osysharp.MicrosoftGraph;
+using Osysharp.Http;
+
+[Test]
+void the_token_that_goes_out_is_WHATEVER_THE_CALLER_SUPPLIED() {
+  // ⛔ THE PER-USER GUARANTEE, END TO END AND IN OSY#. The kit reads no secret; it sends the field it was given.
+  //    So an app whose `GraphToken` is `UserScoped` sends the CALLER's token for the same line of code — and the
+  //    thing this case pins is the half the kit is responsible for: the field reaches the wire unchanged.
+  List<string> sent = [];
+  Http.Get.Stub((url, body, headers) => {
+    sent.Add(headers["Authorization"]);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"u1\"}" };
+  });
+
+  new GraphClient { AccessToken = "alices-delegated-token" }.Me();
+  new GraphClient { AccessToken = "bobs-delegated-token" }.Me();
+
+  Assert.Equal("Bearer alices-delegated-token", sent[0]);
+  Assert.Equal("Bearer bobs-delegated-token", sent[1]);
+}
+```
+
+From [`tests/graph.test.osy`](tests/graph.test.osy).
+
+```osy
+using Osysharp.MicrosoftGraph;
+using Osysharp.Http;
+
+[Test]
+void send_mail_wraps_the_message_and_saves_to_sent_items_by_default() {
+  // ⛔ THE DEFAULT GRAPH GETS BACKWARDS. `saveToSentItems` defaults to FALSE at the API, so a correct-looking
+  //    integration sends mail the user has no record of ever sending. This kit flips it.
+  // ⚑ A LIST, because an Osy# lambda captures by VALUE — assigning to an outer `string` inside a stub writes into
+  //   a frame that is discarded, and the compiler says so. Every kit's tests capture this way.
+  List<string> posted = [];
+  Http.Post.Stub((url, sent) => { posted.Add(sent); return new HttpResponse { StatusCode = 202, Body = "" }; });
+
+  Client().SendMail("Hello", "Body text", ["ada@test"]);
+
+  Assert.Contains("\"saveToSentItems\":true", posted[0]);
+  Assert.Contains("\"message\"", posted[0]);                 // wrapped, not bare
+  Assert.Contains("\"address\":\"ada@test\"", posted[0]);
+  Assert.Contains("\"contentType\":\"text\"", posted[0]);
+}
+```
+
+From [`tests/graph.test.osy`](tests/graph.test.osy).
+
+## Learn more
+
+- [Osysharp.MicrosoftGraph in the package catalogue](https://osysharp.com/packages/#osysharp-microsoftgraph)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
